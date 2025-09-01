@@ -1,5 +1,5 @@
-# 1_🔥_Home.py  — Wildfire Detection (Image + Video)
-# Streamlit Cloud (CPU) 기준 안정 동작용
+# 1_🔥_Home.py — Wildfire Detection (Image + Video)
+# Streamlit Cloud (CPU) 환경 호환 / 이미지 & 비디오 통합
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
@@ -11,6 +11,7 @@ from glob import glob
 import cv2
 import requests
 import streamlit as st
+import numpy as np
 from numpy import random
 from PIL import Image
 from ultralytics import YOLO
@@ -18,29 +19,11 @@ from ultralytics import YOLO
 
 # ========================= 공통 유틸 =========================
 
-def _safe_names(model, res0=None):
-    """
-    클래스 이름 추출을 최대한 호환성 있게 처리
-    """
-    # 우선 결과 객체에 names가 있으면 사용
-    if res0 is not None and hasattr(res0, "names") and res0.names:
-        return res0.names
-    # 모델에 names가 dict/list로 있을 수 있음
-    if hasattr(model, "names") and model.names:
-        return model.names
-    if hasattr(model, "model") and hasattr(model.model, "names"):
-        return model.model.names
-    # 최후의 보루
-    return {0: "object"}
-
 def _rgb(img_bgr):
     return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
 def _resize_keep_aspect(frame, target_w=None, max_w=None):
-    """
-    frame을 가로 기준으로 리사이즈. target_w가 있으면 그 폭으로,
-    max_w가 있으면 그 이하일 때만 축소.
-    """
+    """가로 기준 리사이즈(성능 보정용)."""
     h, w = frame.shape[:2]
     if target_w is not None and target_w > 0 and w != target_w:
         new_w = int(target_w)
@@ -52,42 +35,58 @@ def _resize_keep_aspect(frame, target_w=None, max_w=None):
         return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
     return frame
 
+def _safe_names(model, res0=None):
+    """클래스 이름 안전 추출."""
+    if res0 is not None and hasattr(res0, "names") and res0.names:
+        return res0.names
+    if hasattr(model, "names") and model.names:
+        return model.names
+    if hasattr(model, "model") and hasattr(model.model, "names"):
+        return model.model.names
+    return {0: "object"}
+
+def _looks_like_lfs_pointer(path: str) -> bool:
+    """LFS 포인터 파일 간단 감지(안전용)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(256)
+        return b"git-lfs" in head or b"oid sha256" in head or b"version https://git-lfs.github.com/spec" in head
+    except Exception:
+        return False
+
 
 # ========================= 모델 로더 =========================
 
 @st.cache_resource
 def load_model(model_path: str | None):
     """
-    1) 지정 경로의 .pt 로드 시도
-    2) 실패 시 general-models/yolov8n.pt 폴백
-    3) 그래도 실패 시 내장 yolov8n.pt 폴백
+    1) 지정 경로 .pt 로드
+    2) 실패 시 저장소의 general-models/yolov8n.pt 폴백
+    3) 최종 폴백: 패키지 yolov8n.pt
     """
-    # 1) 직접 경로 시도
-    if model_path and os.path.exists(model_path) and os.path.getsize(model_path) > 1_000_00:  # >100KB
+    # 1) 사용자 선택 경로
+    if model_path and os.path.exists(model_path) and os.path.getsize(model_path) > 100_000 and not _looks_like_lfs_pointer(model_path):
         try:
             return YOLO(model_path)
         except Exception as e:
-            st.warning(f"커스텀 가중치 로드 실패: {e}. 폴백을 시도합니다…")
+            st.warning(f"가중치 로드 실패({e}). 폴백 시도…")
 
-    # 2) 저장소 내 기본 폴백
+    # 2) 저장소 폴백
     fallback_local = os.path.join("general-models", "yolov8n.pt")
-    if os.path.exists(fallback_local):
+    if os.path.exists(fallback_local) and not _looks_like_lfs_pointer(fallback_local):
         try:
             return YOLO(fallback_local)
         except Exception as e:
-            st.warning(f"로컬 폴백 로드 실패: {e}. 최종 폴백을 시도합니다…")
+            st.warning(f"로컬 폴백 로드 실패({e}). 최종 폴백 시도…")
 
-    # 3) 최종 폴백: 패키지 기본 가중치
+    # 3) 최종 폴백
     return YOLO("yolov8n.pt")
 
 
-# ========================= 추론 함수 (이미지) =========================
+# ========================= 추론 (이미지) =========================
 
 def predict_image(model, image_pil: Image.Image, conf_threshold: float, iou_threshold: float):
-    """
-    PIL.Image 입력 → YOLO 추론 → 시각화/문구/지연시간 반환
-    """
-    # PIL → OpenCV(BGR)
+    """PIL.Image -> YOLO 추론 -> 시각화/문구/지연시간 반환."""
     img_bgr = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
 
     res = model.predict(
@@ -124,7 +123,24 @@ def predict_image(model, image_pil: Image.Image, conf_threshold: float, iou_thre
     return _rgb(vis), prediction_text
 
 
-# ========================= 추론 함수 (비디오) =========================
+# ========================= 추론 (비디오) =========================
+
+def _resolve_video_source(src: str) -> str:
+    """
+    원격 URL이면 임시파일로 저장해서 OpenCV가 안정적으로 열도록 변환.
+    로컬 경로/업로드 파일이면 그대로 반환.
+    """
+    if isinstance(src, str) and src.startswith(("http://", "https://")):
+        suffix = os.path.splitext(src)[1] or ".mp4"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        with requests.get(src, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            for chunk in r.iter_content(1 << 20):
+                if chunk:
+                    tmp.write(chunk)
+        tmp.flush()
+        return tmp.name
+    return src
 
 def predict_video(model,
                   source,
@@ -135,28 +151,26 @@ def predict_video(model,
                   max_frames: int = 1200,
                   stop_flag_key: str = "stop_video"):
     """
-    source: 파일 경로 또는 URL
-    frame_skip: n이면 1/n 프레임만 처리
-    resize_w: 가로 리사이즈 폭(너무 큰 영상 성능 보정)
-    max_frames: 안전 종료용 최대 처리 프레임
-    stop_flag_key: 세션 키로 Stop 버튼 연동
+    source: 파일 경로 또는 URL(내부에서 임시파일 변환)
+    frame_skip: n이면 1/n 프레임만 추론
+    resize_w: 가로 리사이즈(성능 보정)
+    max_frames: 안전 종료 상한
     """
-    cap = cv2.VideoCapture(source)
+    path = _resolve_video_source(source)
+    cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         st.error("Failed to open video.")
         return
 
     canvas = st.empty()
     info = st.empty()
-
     processed = 0
     t0 = time.time()
 
-    # Stop 버튼
     if stop_flag_key not in st.session_state:
         st.session_state[stop_flag_key] = False
 
-    stop_col1, stop_col2, stop_col3 = st.columns([1, 1, 2])
+    stop_col1, stop_col2, _ = st.columns([1, 2, 2])
     with stop_col1:
         if st.button("⏹ Stop"):
             st.session_state[stop_flag_key] = True
@@ -178,7 +192,10 @@ def predict_video(model,
             continue
 
         # 리사이즈
-        frame = _resize_keep_aspect(frame, target_w=resize_w if resize_w and resize_w > 0 else None)
+        if resize_w and frame.shape[1] > resize_w:
+            h, w = frame.shape[:2]
+            new_h = int(h * (resize_w / w))
+            frame = cv2.resize(frame, (resize_w, new_h), interpolation=cv2.INTER_AREA)
 
         # 추론
         res = model.predict(
@@ -188,26 +205,22 @@ def predict_video(model,
             device="cpu",
             verbose=False,
         )
-        res0 = res[0] if res else None
-        vis = res0.plot() if res0 is not None else frame
-
+        vis = res[0].plot() if res else frame
         canvas.image(_rgb(vis), caption=f"Frame {processed}", use_column_width=True)
 
-        # 진행 정보
         elapsed = time.time() - t0
         fps = (processed / elapsed) if elapsed > 0 else 0.0
         info.info(f"Processed: {processed} frames  |  ~{fps:.1f} FPS (incl. skip, resized)")
+
         if processed >= max_frames:
             st.warning("Max frames reached; stopping.")
             break
 
     cap.release()
-    st.session_state[stop_flag_key] = False  # 다음 실행을 위해 리셋
+    st.session_state[stop_flag_key] = False  # 리셋
 
 
 # ========================= 메인 앱 =========================
-
-import numpy as np  # (여기 두는 이유: predict_image에서 np 사용)
 
 def main():
     st.set_page_config(page_title="Wildfire Detection", page_icon="🔥", initial_sidebar_state="collapsed")
@@ -219,7 +232,7 @@ def main():
     st.sidebar.markdown("Email: [alim.tleuliyev@nu.edu.kz](mailto:alim.tleuliyev@nu.edu.kz)")
     st.sidebar.markdown("Telegram: [@nativealim](https://t.me/nativealim)")
 
-    # 간단 스타일
+    # 간단 스타일 & 타이틀
     st.markdown(
         """
         <style>
@@ -245,8 +258,8 @@ def main():
         """
         <div style='text-align: center;'>
             <h2>🔥 <strong>Wildfire Detection App</strong></h2>
-            <p>Powered by <a href='https://github.com/ultralytics/ultralytics'>YOLOv8</a> trained on <a href='https://github.com/gaiasd/DFireDataset'>D-Fire</a>.</p>
-            <p>Upload an image/video or provide a URL to test.</p>
+            <p>Powered by <a href='https://github.com/ultralytics/ultralytics'>YOLOv8</a> (D-Fire 데이터 기반).</p>
+            <p>이미지/비디오를 업로드하거나 URL을 입력해 테스트하세요.</p>
         </div>
         """,
         unsafe_allow_html=True
@@ -265,7 +278,6 @@ def main():
 
     with colB:
         if model_files:
-            # fire_n/fire_s 가 있으면 그것부터 선택되게
             default_idx = 0
             try:
                 if model_type != "General":
@@ -286,10 +298,9 @@ def main():
 
     st.markdown("---")
 
-    # 모드: 이미지 / 비디오
+    # 공통 파라미터
     media_kind = st.radio("What to test?", ("Image", "Video"), index=0)
 
-    # 공통 파라미터
     colT1, colT2 = st.columns(2)
     with colT2:
         conf_threshold = st.slider("Confidence Threshold", 0.0, 1.0, 0.20, 0.05)
@@ -346,14 +357,14 @@ def main():
             if vurl:
                 video_path = vurl
 
-        # 비디오 처리 파라미터
+        # 성능 조절
         c1, c2, c3 = st.columns(3)
         with c1:
-            frame_skip = st.slider("Frame skip", 1, 8, 2, 1, help="큰 값일수록 덜 많은 프레임을 처리 → 더 빠름")
+            frame_skip = st.slider("Frame skip", 1, 8, 2, 1, help="큰 값일수록 덜 많은 프레임 추론 → 더 빠름")
         with c2:
-            resize_w = st.slider("Resize width", 320, 1280, 960, 40, help="가로 폭 리사이즈(성능 향상용)")
+            resize_w = st.slider("Resize width", 320, 1280, 960, 40, help="가로 리사이즈(성능 향상)")
         with c3:
-            max_frames = st.slider("Max frames", 100, 4000, 1200, 100, help="안전 종료용 최대 처리 프레임")
+            max_frames = st.slider("Max frames", 100, 4000, 1200, 100, help="안전 종료 상한")
 
         if video_path:
             if st.button("▶ Start video inference"):
@@ -368,7 +379,7 @@ def main():
 
     # 하단 안내
     st.markdown("---")
-    st.caption("Tip: Cloud는 CPU 환경입니다. 프레임 스킵/리사이즈를 조절하면 더 매끄럽게 동작합니다.")
+    st.caption("Tip: Cloud는 CPU 환경입니다. Frame skip/Resize를 조절하면 더 매끄럽게 동작합니다.")
 
 
 if __name__ == "__main__":
