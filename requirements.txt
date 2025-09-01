@@ -1,4 +1,12 @@
-ultralytics==8.0.136
-streamlit==1.24.0
-py-cpuinfo
-requests
+streamlit==1.36.0
+ultralytics==8.3.34
+opencv-python-headless==4.12.0.88
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
+numpy==2.1.3
+pandas==2.3.2
+scipy==1.16.1
+pillow==11.3.0
+requests==2.32.3
+py-cpuinfo==9.0.0
