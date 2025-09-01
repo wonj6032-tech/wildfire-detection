@@ -251,12 +251,35 @@ def main():
     # 디버그 배너: 빌드 확인용
     st.info(f"VIDEO BUILD ACTIVE — {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
-    # 사이드바
-    st.sidebar.markdown("Developed by Alim Tleuliyev")
-    st.sidebar.markdown("LinkedIn: [Profile](https://www.linkedin.com/in/alimtleuliyev/)")
-    st.sidebar.markdown("GitHub: [Repo](https://github.com/AlimTleuliyev/wildfire-detection)")
-    st.sidebar.markdown("Email: [alim.tleuliyev@nu.edu.kz](mailto:alim.tleuliyev@nu.edu.kz)")
-    st.sidebar.markdown("Telegram: [@nativealim](https://t.me/nativealim)")
+    # ---- Sidebar: Credits Card (optional fancy style) ----
+    st.sidebar.markdown(
+    """
+    <style>
+      .credit-card{
+        padding:12px 14px; border:1px solid #e5e7eb; border-radius:12px;
+        background:#fafafa; font-size:14px; line-height:1.45;
+      }
+      .credit-card b{font-size:15px;}
+      .credit-item{ margin:6px 0; }
+      .credit-card a{ text-decoration:none; }
+    </style>
+    <div class="credit-card">
+      <div class="credit-item"><b>👤 Original author</b><br/>
+        <a href="https://www.linkedin.com/in/alimtleuliyev/" target="_blank">Alim Tleuliyev</a>
+      </div>
+      <div class="credit-item"><b>🛠 Modified by</b><br/>
+        <b>Wonjin Choi</b> (WOW Future Technology)
+      </div>
+      <hr/>
+      <div class="credit-item">🐙 <b>GitHub</b><br/>
+        <a href="https://github.com/AlimTleuliyev/wildfire-detection" target="_blank">Original repo</a><br/>
+        <a href="https://github.com/wonj6032-tech/wildfire-detection" target="_blank">This fork</a>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+  
 
     # 타이틀/로고
     st.markdown("<h1 style='text-align:center;'>Wildfire Detection</h1>", unsafe_allow_html=True)
