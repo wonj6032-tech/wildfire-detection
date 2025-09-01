@@ -251,36 +251,19 @@ def main():
     # 디버그 배너: 빌드 확인용
     st.info(f"VIDEO BUILD ACTIVE — {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
-    # ---- Sidebar: Credits Card (optional fancy style) ----
+    # ---- Sidebar: Credits & Links (replace the old sidebar block) ----
+    st.sidebar.markdown("### 👥 Credits")
     st.sidebar.markdown(
-    """
-    <style>
-      .credit-card{
-        padding:12px 14px; border:1px solid #e5e7eb; border-radius:12px;
-        background:#fafafa; font-size:14px; line-height:1.45;
-      }
-      .credit-card b{font-size:15px;}
-      .credit-item{ margin:6px 0; }
-      .credit-card a{ text-decoration:none; }
-    </style>
-    <div class="credit-card">
-      <div class="credit-item"><b>👤 Original author</b><br/>
-        <a href="https://www.linkedin.com/in/alimtleuliyev/" target="_blank">Alim Tleuliyev</a>
-      </div>
-      <div class="credit-item"><b>🛠 Modified by</b><br/>
-        <b>Wonjin Choi</b> (WOW Future Technology)
-      </div>
-      <hr/>
-      <div class="credit-item">🐙 <b>GitHub</b><br/>
-        <a href="https://github.com/AlimTleuliyev/wildfire-detection" target="_blank">Original repo</a><br/>
-        <a href="https://github.com/wonj6032-tech/wildfire-detection" target="_blank">This fork</a>
-      </div>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-  
+        "- **Original author**: [Alim Tleuliyev](https://www.linkedin.com/in/alimtleuliyev/)\n"
+        "- **Modified by**: **Wonjin Choi** (WOW Future Technology)"
+    )
 
+    st.sidebar.markdown("### 🔗 Links")
+    st.sidebar.markdown(
+        "- GitHub (original): [AlimTleuliyev/wildfire-detection](https://github.com/AlimTleuliyev/wildfire-detection)\n"
+        "- GitHub (this fork): [wonj6032-tech/wildfire-detection](https://github.com/wonj6032-tech/wildfire-detection)"
+    )
+  
     # 타이틀/로고
     st.markdown("<h1 style='text-align:center;'>Wildfire Detection</h1>", unsafe_allow_html=True)
     logos = glob('dalle-logos/*.png')
