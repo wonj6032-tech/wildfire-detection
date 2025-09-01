@@ -1,7 +1,7 @@
 import streamlit as st  # type: ignore
 import cv2
 from ultralytics import YOLO
-import requests # type: ignore
+import requests  # type: ignore
 from PIL import Image
 import os
 from glob import glob
@@ -10,243 +10,242 @@ import io
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
-# Function to load the YOLO model
-@st.cache_resource
-def load_model(model_path):
-    model = YOLO(model_path)
-    return model
+# ===================== [ADD] 안전한 가중치 로더 =====================
 
-# Function to predict objects in the image
+# ▶ Secrets에 넣어두면 코드에 노출되지 않습니다.
+WEIGHT_URL = st.secrets.get(
+    "WEIGHT_URL",
+    ""  # 예: "https://github.com/<you>/<repo>/releases/download/<tag>/yolov8n_fire.pt"
+)
+LOCAL_WEIGHT = "/tmp/yolov8n_fire.pt"  # Streamlit Cloud는 /tmp 권장
+MIN_VALID_SIZE = 1_000_000  # 1MB 미만이면 비정상으로 판단(포인터/손상 가능)
+
+def _is_lfs_pointer(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(256)
+        return b"git-lfs" in head or b"oid sha256" in head or b"version https://git-lfs.github.com/spec" in head
+    except Exception:
+        return False
+
+def _download_weight(url: str, path: str) -> None:
+    st.info("Downloading model weights…")
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    with open(path, "wb") as f:
+        f.write(r.content)
+
+def ensure_weight(path: str = LOCAL_WEIGHT, url: str = WEIGHT_URL) -> str:
+    """
+    - 경로에 파일이 없거나 너무 작거나(LFS 포인터 의심), 실제 LFS 포인터면 URL에서 재다운.
+    - 최종적으로 유효한 로컬 경로를 반환.
+    """
+    need_download = False
+    if not os.path.exists(path) or os.path.getsize(path) < MIN_VALID_SIZE:
+        need_download = True
+    elif _is_lfs_pointer(path):
+        need_download = True
+
+    if need_download:
+        if not url:
+            raise RuntimeError("WEIGHT_URL이 설정되지 않았습니다. Streamlit Secrets 또는 코드 상단 WEIGHT_URL을 설정하세요.")
+        _download_weight(url, path)
+
+    if _is_lfs_pointer(path) or os.path.getsize(path) < MIN_VALID_SIZE:
+        raise RuntimeError("가중치 파일이 여전히 LFS 포인터/손상 상태로 보입니다.")
+    return path
+
+# ===================== [MOD] 모델 로더 (런타임 다운로드 + 폴백) =====================
+
+@st.cache_resource
+def load_model(model_path: str | None):
+    """
+    1) 사용자가 고른 경로가 정상 .pt면 그대로 로드
+    2) 비정상이면 런타임 다운로드(ensure_weight)로 우회
+    3) 그래도 실패하면 yolov8n.pt로 폴백
+    """
+    # 1) 사용자가 선택한 경로 우선 시도
+    if model_path and os.path.exists(model_path) and os.path.getsize(model_path) >= MIN_VALID_SIZE and not _is_lfs_pointer(model_path):
+        try:
+            return YOLO(model_path)
+        except Exception as e:
+            st.warning(f"커스텀 가중치 로드 실패: {e}. 런타임 다운로드로 재시도합니다…")
+
+    # 2) 런타임 다운로드 우회
+    try:
+        wp = ensure_weight()
+        return YOLO(wp)
+    except Exception as e:
+        st.warning(f"런타임 다운로드 방식 실패: {e}. 기본 yolov8n.pt로 폴백합니다…")
+
+    # 3) 최후의 폴백
+    return YOLO("yolov8n.pt")
+
+# ===================== 추론 함수 =====================
+
 def predict_image(model, image, conf_threshold, iou_threshold):
-    # Predict objects using the model
     res = model.predict(
         image,
         conf=conf_threshold,
         iou=iou_threshold,
         device='cpu',
     )
-    
+
     class_name = model.model.names
-    classes = res[0].boxes.cls
+    classes = res[0].boxes.cls if res and res[0].boxes is not None else []
     class_counts = {}
-    
-    # Count the number of occurrences for each class
+
     for c in classes:
         c = int(c)
         class_counts[class_name[c]] = class_counts.get(class_name[c], 0) + 1
 
-    # Generate prediction text
     prediction_text = 'Predicted '
     for k, v in sorted(class_counts.items(), key=lambda item: item[1], reverse=True):
         prediction_text += f'{v} {k}'
-        
         if v > 1:
             prediction_text += 's'
-        
         prediction_text += ', '
+    prediction_text = prediction_text[:-2] if class_counts else "No objects detected"
 
-    prediction_text = prediction_text[:-2]
-    if len(class_counts) == 0:
-        prediction_text = "No objects detected"
-
-    # Calculate inference latency
-    latency = sum(res[0].speed.values())  # in ms, need to convert to seconds
-    latency = round(latency / 1000, 2)
+    latency_ms = sum(res[0].speed.values()) if res and len(res) > 0 else 0.0
+    latency = round(latency_ms / 1000, 2)
     prediction_text += f' in {latency} seconds.'
 
-    # Convert the result image to RGB
-    res_image = res[0].plot()
+    res_image = res[0].plot() if res and len(res) > 0 else image
     res_image = cv2.cvtColor(res_image, cv2.COLOR_BGR2RGB)
-    
+
     return res_image, prediction_text
 
+# ===================== 메인 =====================
+
 def main():
-    # Set Streamlit page configuration
     st.set_page_config(
         page_title="Wildfire Detection",
         page_icon="🔥",
         initial_sidebar_state="collapsed",
     )
-    
-    # Sidebar information
+
     st.sidebar.markdown("Developed by Alim Tleuliyev")
     st.sidebar.markdown("LinkedIn: [Profile](https://www.linkedin.com/in/alimtleuliyev/)")
     st.sidebar.markdown("GitHub: [Repo](https://github.com/AlimTleuliyev/wildfire-detection)")
     st.sidebar.markdown("Email: [alim.tleuliyev@nu.edu.kz](mailto:alim.tleuliyev@nu.edu.kz)")
     st.sidebar.markdown("Telegram: [@nativealim](https://t.me/nativealim)")
 
-    # Set custom CSS styles
     st.markdown(
         """
         <style>
-        .container {
-            max-width: 800px;
-        }
-        .title {
-            text-align: center;
-            font-size: 35px;
-            font-weight: bold;
-            margin-bottom: 10px;
-        }
-        .description {
-            margin-bottom: 30px;
-        }
-        .instructions {
-            margin-bottom: 20px;
-            padding: 10px;
-            background-color: #f5f5f5;
-            border-radius: 5px;
-        }
+        .container { max-width: 800px; }
+        .title { text-align: center; font-size: 35px; font-weight: bold; margin-bottom: 10px; }
+        .description { margin-bottom: 30px; }
+        .instructions { margin-bottom: 20px; padding: 10px; background-color: #f5f5f5; border-radius: 5px; }
         </style>
         """,
         unsafe_allow_html=True
     )
-
-    # App title
     st.markdown("<div class='title'>Wildfire Detection</div>", unsafe_allow_html=True)
 
-    # Logo and description
     col1, col2, col3 = st.columns([1, 2, 1])
     with col1:
         st.write("")
     with col2:
         logos = glob('dalle-logos/*.png')
-        logo = random.choice(logos)
-        st.image(logo, use_column_width=True, caption="Generated by DALL-E")
+        if logos:
+            logo = random.choice(logos)
+            st.image(logo, use_column_width=True, caption="Generated by DALL-E")
+            st.sidebar.image(logo, use_column_width=True, caption="Generated by DALL-E")
+        else:
+            st.caption("No logo images found.")
+            logo = None
     with col3:
         st.write("")
 
-    st.sidebar.image(logo, use_column_width=True, caption="Generated by DALL-E")
-
-    # Description
-
     st.markdown(
-    """
-    <div style='text-align: center;'>
-        <h2>🔥 <strong>Wildfire Detection App</strong></h2>
-        <p>Welcome to our Wildfire Detection App! Powered by the <a href='https://github.com/ultralytics/ultralytics'>YOLOv8</a> detection model trained on the <a href='https://github.com/gaiasd/DFireDataset'>D-Fire: an image dataset for fire and smoke detection</a>.</p>
-        <h3>🌍 <strong>Preventing Wildfires with Computer Vision</strong></h3>
-        <p>Our goal is to prevent wildfires by detecting fire and smoke in images with high accuracy and speed.</p>
-        <h3>📸 <strong>Try It Out!</strong></h3>
-        <p>Experience the effectiveness of our detection model by uploading an image or providing a URL.</p>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-
-    # Add a separator
+        """
+        <div style='text-align: center;'>
+            <h2>🔥 <strong>Wildfire Detection App</strong></h2>
+            <p>Welcome! Powered by <a href='https://github.com/ultralytics/ultralytics'>YOLOv8</a> trained on <a href='https://github.com/gaiasd/DFireDataset'>D-Fire</a>.</p>
+            <h3>🌍 <strong>Preventing Wildfires with Computer Vision</strong></h3>
+            <p>Detect fire and smoke in images with high accuracy and speed.</p>
+            <h3>📸 <strong>Try It Out!</strong></h3>
+            <p>Upload an image or provide a URL.</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
     st.markdown("---")
 
-    # Model selection
+    # 모델 선택
     col1, col2 = st.columns(2)
     with col1:
         model_type = st.radio("Select Model Type", ("Fire Detection", "General"), index=0)
 
     models_dir = "general-models" if model_type == "General" else "fire-models"
-    model_files = [f.replace(".pt", "") for f in os.listdir(models_dir) if f.endswith(".pt")]
-    
-    with col2:
-        selected_model = st.selectbox("Select Model Size", sorted(model_files), index=2)
+    model_files = []
+    if os.path.isdir(models_dir):
+        model_files = [f.replace(".pt", "") for f in os.listdir(models_dir) if f.endswith(".pt")]
+    if not model_files:
+        st.warning(f"'{models_dir}' 폴더에서 .pt 파일을 찾지 못했습니다. 런타임 다운로드/폴백을 사용합니다.")
+        selected_model = None
+    else:
+        with col2:
+            # 인덱스 보호
+            default_idx = min(2, max(0, len(sorted(model_files)) - 1))
+            selected_model = st.selectbox("Select Model Size", sorted(model_files), index=default_idx)
 
-    # Model and general info
-    col1, col2 = st.columns(2)
-    with col1:
-        with st.expander("What is General?"):
-            st.caption("The General model is an additional model that was added for demonstration purposes.")
-            st.caption("It is pre-trained on the COCO dataset, which consists of various objects across 80 classes.")
-            st.caption("Please note that this model may not be optimized specifically for fire detection.")
-            st.caption("For accurate fire and smoke detection, it is recommended to choose the Fire Detection model.")
-            st.caption("The General model can be used to detect objects commonly found in everyday scenes.")
-    
-    with col2:
-        with st.expander("Size Information"):
-            st.caption("Models are available in different sizes, indicated by n, s, m, and l.")
-            st.caption("- n: Nano")
-            st.caption("- s: Small")
-            st.caption("- m: Medium")
-            st.caption("- l: Large")
-            st.caption("The larger the model, the more precise the detections, but the slower the inference time.")
-            st.caption("On the other hand, smaller models are faster but may sacrifice some precision.")
-            st.caption("Choose a model based on the trade-off between speed and precision that best suits your needs.")
+    # 모델 로드
+    model_path = os.path.join(models_dir, selected_model + ".pt") if selected_model else None
+    with st.spinner("Loading model…"):
+        model = load_model(model_path)
 
-    # Load the selected model
-    model_path = os.path.join(models_dir, selected_model + ".pt") #type: ignore
-    model = load_model(model_path)
-
-    # Add a section divider
     st.markdown("---")
 
-    # Set confidence and IOU thresholds
+    # Thresholds
     col1, col2 = st.columns(2)
     with col2:
         conf_threshold = st.slider("Confidence Threshold", 0.0, 1.0, 0.20, 0.05)
         with st.expander("What is Confidence Threshold?"):
-            st.caption("The Confidence Threshold is a value between 0 and 1.")
-            st.caption("It determines the minimum confidence level required for an object detection.")
-            st.caption("If the confidence of a detected object is below this threshold, it will be ignored.")
-            st.caption("You can adjust this threshold to control the number of detected objects.")
-            st.caption("Lower values make the detection more strict, while higher values allow more detections.")
+            st.caption("Minimum confidence for a detection to be kept.")
     with col1:
         iou_threshold = st.slider("IOU Threshold", 0.0, 1.0, 0.5, 0.05)
         with st.expander("What is IOU Threshold?"):
-            st.caption("The IOU (Intersection over Union) Threshold is a value between 0 and 1.")
-            st.caption("It determines the minimum overlap required between the predicted bounding box")
-            st.caption("and the ground truth box for them to be considered a match.")
-            st.caption("You can adjust this threshold to control the precision and recall of the detections.")
-            st.caption("Higher values make the matching more strict, while lower values allow more matches.")
+            st.caption("Overlap threshold for NMS.")
 
-    # Add a section divider
     st.markdown("---")
 
-    # Image selection
+    # 이미지 입력
     image = None
     image_source = st.radio("Select image source:", ("Enter URL", "Upload from Computer"))
+
     if image_source == "Upload from Computer":
-        # File uploader for image
         uploaded_file = st.file_uploader("Upload an image", type=["png", "jpg", "jpeg"])
         if uploaded_file is not None:
-            image = Image.open(uploaded_file)
-        else:
-            image = None
-
+            image = Image.open(uploaded_file).convert("RGB")
     else:
-        # Input box for image URL
         url = st.text_input("Enter the image URL:")
         if url:
             try:
-                response = requests.get(url, stream=True)
-                if response.status_code == 200:
-                    image = Image.open(response.raw)
-                else:
-                    st.error("Error loading image from URL.")
-                    image = None
-            except requests.exceptions.RequestException as e:
+                r = requests.get(url, timeout=20)
+                r.raise_for_status()
+                image = Image.open(io.BytesIO(r.content)).convert("RGB")
+            except Exception as e:
                 st.error(f"Error loading image from URL: {e}")
                 image = None
 
     if image:
-        # Display the uploaded image
-        with st.spinner("Detecting"):
+        with st.spinner("Detecting…"):
             prediction, text = predict_image(model, image, conf_threshold, iou_threshold)
             st.image(prediction, caption="Prediction", use_column_width=True)
             st.success(text)
-        
-        prediction = Image.fromarray(prediction)
 
-        # Create a BytesIO object to temporarily store the image data
-        image_buffer = io.BytesIO()
-
-        # Save the image to the BytesIO object in PNG format
-        prediction.save(image_buffer, format='PNG')
-
-        # Create a download button for the image
+        prediction_pil = Image.fromarray(prediction)
+        buf = io.BytesIO()
+        prediction_pil.save(buf, format='PNG')
         st.download_button(
             label='Download Prediction',
-            data=image_buffer.getvalue(),
-            file_name='prediciton.png',
+            data=buf.getvalue(),
+            file_name='prediction.png',
             mime='image/png'
         )
 
-        
 if __name__ == "__main__":
     main()
