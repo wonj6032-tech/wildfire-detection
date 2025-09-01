@@ -1,4 +1,4 @@
-# 1_🔥_Home.py — Wildfire Detection (Image + Video, Tabs + Debug)
+# 1_🔥_Home.py — Wildfire Detection (Image + Video, Tabs + Live HUD)
 # Streamlit Cloud (CPU) 환경 호환 / 단일 페이지
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
@@ -120,11 +120,11 @@ def predict_image(model, image_pil: Image.Image, conf_threshold: float, iou_thre
 
     latency_ms = sum(res0.speed.values()) if (res0 is not None and hasattr(res0, "speed")) else 0.0
     text += f" in {round(latency_ms / 1000, 2)} seconds."
-    vis = res0.plot() if res0 is not None else img_bgr
+    vis = res[0].plot() if res else img_bgr
     return _rgb(vis), text
 
 
-# ========================= 추론 (비디오) =========================
+# ========================= 추론 (비디오 — 라이브 HUD 오버레이) =========================
 
 def predict_video(model,
                   source,
@@ -133,34 +133,38 @@ def predict_video(model,
                   frame_skip: int = 2,
                   resize_w: int | None = 960,
                   max_frames: int = 1200,
-                  stop_key: str = "stop_video"):
+                  stop_key: str = "stop_video",
+                  hud: bool = True,
+                  preview: bool = False):
+    import collections
+
+    def _put_text(img, text, y, color=(0, 255, 0)):
+        cv2.putText(img, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+
     path = _resolve_video_source(source)
-    # 미리보기(디코더 테스트)
-    st.video(path)
+    if preview:
+        st.video(path)  # 필요 시만 미리보기
 
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         st.error("Failed to open video with OpenCV.")
         return
 
-    canvas = st.empty()
-    info = st.empty()
+    canvas = st.empty()          # 실시간 영상 표시(캡션/프레임번호 없음)
     processed = 0
-    t0 = time.time()
+    t_prev = time.time()
+    fps_hist = collections.deque(maxlen=15)  # FPS 스무딩
 
+    # Stop 버튼(상단)
     if stop_key not in st.session_state:
         st.session_state[stop_key] = False
-
-    cols = st.columns([1, 2, 2])
+    cols = st.columns([1, 4, 1])
     with cols[0]:
         if st.button("⏹ Stop"):
             st.session_state[stop_key] = True
-    with cols[1]:
-        st.caption("Stop을 누르면 다음 루프에서 종료됩니다.")
 
     while True:
         if st.session_state[stop_key]:
-            info.info("Stopped by user.")
             break
 
         ret, frame = cap.read()
@@ -168,24 +172,53 @@ def predict_video(model,
             break
         processed += 1
 
+        # 프레임 스킵
         if frame_skip > 1 and (processed % frame_skip) != 0:
             continue
 
+        # 리사이즈(성능)
         if resize_w and frame.shape[1] > resize_w:
             h, w = frame.shape[:2]
             new_h = int(h * (resize_w / w))
             frame = cv2.resize(frame, (resize_w, new_h), interpolation=cv2.INTER_AREA)
 
+        # 추론
         res = model.predict(frame, conf=conf_threshold, iou=iou_threshold, device="cpu", verbose=False)
-        vis = res[0].plot() if res else frame
-        canvas.image(_rgb(vis), caption=f"Frame {processed}", use_column_width=True)
+        vis = res[0].plot() if res else frame  # BGR
 
-        elapsed = time.time() - t0
-        fps = (processed / elapsed) if elapsed > 0 else 0.0
-        info.info(f"Processed: {processed} frames  |  ~{fps:.1f} FPS (incl. skip, resized)")
+        # FPS 계산(스무딩)
+        t_now = time.time()
+        dt = max(t_now - t_prev, 1e-6)
+        fps_hist.append(1.0 / dt)
+        t_prev = t_now
+        fps_smoothed = sum(fps_hist) / len(fps_hist)
+
+        if hud:
+            # 클래스 카운트
+            counts_txt = ""
+            try:
+                names = _safe_names(model, res[0])
+                cls = res[0].boxes.cls if (res and res[0].boxes is not None) else []
+                cc = {}
+                for c in cls:
+                    c = int(c)
+                    name = names[c] if isinstance(names, (list, tuple)) else names.get(c, str(c))
+                    cc[name] = cc.get(name, 0) + 1
+                if cc:
+                    parts = [f"{k}:{v}" for k, v in sorted(cc.items(), key=lambda x: x[1], reverse=True)]
+                    counts_txt = " | ".join(parts)
+            except Exception:
+                pass
+
+            # 영상 내부에 HUD 텍스트
+            _put_text(vis, f"FPS: {fps_smoothed:.1f}", 28, (0, 255, 0))
+            if counts_txt:
+                _put_text(vis, counts_txt, 58, (255, 200, 0))
+
+        # 실시간 업데이트 (캡션 없이)
+        canvas.image(_rgb(vis), use_column_width=True)
 
         if processed >= max_frames:
-            st.warning("Max frames reached; stopping.")
             break
 
     cap.release()
@@ -305,15 +338,18 @@ def main():
         if video_path:
             if st.button("▶ Start video inference"):
                 with st.spinner("Running video inference…"):
-                    predict_video(model,
-                                  source=video_path,
-                                  conf_threshold=conf_threshold,
-                                  iou_threshold=iou_threshold,
-                                  frame_skip=frame_skip,
-                                  resize_w=resize_w,
-                                  max_frames=max_frames)
+                    predict_video(
+                        model,
+                        source=video_path,
+                        conf_threshold=conf_threshold,
+                        iou_threshold=iou_threshold,
+                        frame_skip=frame_skip,
+                        resize_w=resize_w,
+                        max_frames=max_frames,
+                        hud=True,        # 영상 내부에 HUD(FPS/클래스 카운트) 오버레이
+                        preview=False     # 필요 시 True로 바꾸면 st.video 미리보기 추가
+                    )
 
 
 if __name__ == "__main__":
     main()
-
