@@ -1,5 +1,5 @@
-# 1_🔥_Home.py — Wildfire Detection (Image + Video, Tabs + Live HUD)
-# Streamlit Cloud (CPU) 환경 호환 / 단일 페이지
+# 1_🔥_Home.py — Wildfire Detection (Image + Video, Live HUD, Streaming)
+# Streamlit Cloud (CPU) 최적화: 스트리밍 추론 + 프레임 드롭 + 해상도 축소 + 스레드 튜닝
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
@@ -16,6 +16,16 @@ import numpy as np
 from numpy import random
 from PIL import Image
 from ultralytics import YOLO
+
+# --- CPU thread tuning (Streamlit Cloud) ---
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+try:
+    import torch
+    torch.set_num_threads(1)
+    cv2.setNumThreads(0)
+except Exception:
+    pass
 
 
 # ========================= 유틸 =========================
@@ -54,7 +64,7 @@ def _looks_like_lfs_pointer(path: str) -> bool:
 
 def _resolve_video_source(src: str) -> str:
     """
-    원격 URL이면 임시파일로 받아서 OpenCV가 안정적으로 열도록 변환.
+    원격 URL이면 임시파일로 받아서 OpenCV/Ultralytics가 안정적으로 열도록 변환.
     """
     if isinstance(src, str) and src.startswith(("http://", "https://")):
         suffix = os.path.splitext(src)[1] or ".mp4"
@@ -120,11 +130,11 @@ def predict_image(model, image_pil: Image.Image, conf_threshold: float, iou_thre
 
     latency_ms = sum(res0.speed.values()) if (res0 is not None and hasattr(res0, "speed")) else 0.0
     text += f" in {round(latency_ms / 1000, 2)} seconds."
-    vis = res[0].plot() if res else img_bgr
+    vis = res0.plot() if res0 is not None else img_bgr
     return _rgb(vis), text
 
 
-# ========================= 추론 (비디오 — 라이브 HUD 오버레이) =========================
+# ========================= 추론 (비디오 — 스트리밍 + 라이브 HUD) =========================
 
 def predict_video(model,
                   source,
@@ -132,30 +142,26 @@ def predict_video(model,
                   iou_threshold: float,
                   frame_skip: int = 2,
                   resize_w: int | None = 960,
-                  max_frames: int = 1200,
+                  max_frames: int = 1800,
                   stop_key: str = "stop_video",
                   hud: bool = True,
+                  imgsz: int = 480,        # YOLO 입력 사이즈(작을수록 빠름) 384~512 권장
+                  target_fps: int = 12,    # 화면 갱신 목표 FPS (스로틀) 10~15 권장
                   preview: bool = False):
+    """
+    Ultralytics 스트리밍 추론 + FPS 스로틀 + 프레임 드롭.
+    """
     import collections
+    from time import perf_counter, sleep
 
     def _put_text(img, text, y, color=(0, 255, 0)):
         cv2.putText(img, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
 
     path = _resolve_video_source(source)
     if preview:
-        st.video(path)  # 필요 시만 미리보기
+        st.video(path)  # 필요 시만 디코더 체크용
 
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        st.error("Failed to open video with OpenCV.")
-        return
-
-    canvas = st.empty()          # 실시간 영상 표시(캡션/프레임번호 없음)
-    processed = 0
-    t_prev = time.time()
-    fps_hist = collections.deque(maxlen=15)  # FPS 스무딩
-
-    # Stop 버튼(상단)
+    # Stop 버튼
     if stop_key not in st.session_state:
         st.session_state[stop_key] = False
     cols = st.columns([1, 4, 1])
@@ -163,42 +169,54 @@ def predict_video(model,
         if st.button("⏹ Stop"):
             st.session_state[stop_key] = True
 
-    while True:
+    # YOLO 스트리밍 제너레이터 (내부에서 프레임 읽기)
+    gen = model.predict(
+        source=path,
+        stream=True,
+        conf=conf_threshold,
+        iou=iou_threshold,
+        imgsz=imgsz,            # 입력 다운스케일링 (속도↑)
+        device="cpu",
+        verbose=False
+    )
+
+    canvas = st.empty()
+    fps_hist = collections.deque(maxlen=15)
+    t_prev = perf_counter()
+    processed = 0
+
+    for res in gen:
         if st.session_state[stop_key]:
             break
-
-        ret, frame = cap.read()
-        if not ret:
-            break
         processed += 1
+        if processed > max_frames:
+            break
 
-        # 프레임 스킵
+        # 프레임 스킵(추론 자체 생략)
         if frame_skip > 1 and (processed % frame_skip) != 0:
             continue
 
-        # 리사이즈(성능)
-        if resize_w and frame.shape[1] > resize_w:
-            h, w = frame.shape[:2]
-            new_h = int(h * (resize_w / w))
-            frame = cv2.resize(frame, (resize_w, new_h), interpolation=cv2.INTER_AREA)
+        vis = res.plot()  # 박스/라벨을 영상 안에 직접 그림 (BGR)
 
-        # 추론
-        res = model.predict(frame, conf=conf_threshold, iou=iou_threshold, device="cpu", verbose=False)
-        vis = res[0].plot() if res else frame  # BGR
+        # 표시 전용 리사이즈(성능)
+        if resize_w and vis.shape[1] > resize_w:
+            h, w = vis.shape[:2]
+            new_h = int(h * (resize_w / w))
+            vis = cv2.resize(vis, (resize_w, new_h), interpolation=cv2.INTER_AREA)
 
         # FPS 계산(스무딩)
-        t_now = time.time()
+        t_now = perf_counter()
         dt = max(t_now - t_prev, 1e-6)
         fps_hist.append(1.0 / dt)
         t_prev = t_now
         fps_smoothed = sum(fps_hist) / len(fps_hist)
 
+        # 클래스 카운트 → HUD
         if hud:
-            # 클래스 카운트
             counts_txt = ""
             try:
-                names = _safe_names(model, res[0])
-                cls = res[0].boxes.cls if (res and res[0].boxes is not None) else []
+                names = _safe_names(model, res)
+                cls = res.boxes.cls if (res and res.boxes is not None) else []
                 cc = {}
                 for c in cls:
                     c = int(c)
@@ -209,20 +227,20 @@ def predict_video(model,
                     counts_txt = " | ".join(parts)
             except Exception:
                 pass
-
-            # 영상 내부에 HUD 텍스트
             _put_text(vis, f"FPS: {fps_smoothed:.1f}", 28, (0, 255, 0))
             if counts_txt:
                 _put_text(vis, counts_txt, 58, (255, 200, 0))
 
-        # 실시간 업데이트 (캡션 없이)
+        # 실시간 갱신 (자막 없이 영상만)
         canvas.image(_rgb(vis), use_column_width=True)
 
-        if processed >= max_frames:
-            break
+        # 목표 FPS로 스로틀 (표시 주기 제어)
+        if target_fps > 0:
+            budget = max(0.0, (1.0 / target_fps) - (perf_counter() - t_now))
+            if budget > 0:
+                time.sleep(budget)
 
-    cap.release()
-    st.session_state[stop_key] = False
+    st.session_state[stop_key] = False  # 리셋
 
 
 # ========================= 메인 =========================
@@ -230,7 +248,7 @@ def predict_video(model,
 def main():
     st.set_page_config(page_title="Wildfire Detection", page_icon="🔥", initial_sidebar_state="collapsed")
 
-    # 디버그 배너: 빌드가 새 코드인지 확인용
+    # 디버그 배너: 빌드 확인용
     st.info(f"VIDEO BUILD ACTIVE — {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
     # 사이드바
@@ -279,7 +297,7 @@ def main():
     # 공통 파라미터
     colT1, colT2 = st.columns(2)
     with colT2:
-        conf_threshold = st.slider("Confidence Threshold", 0.0, 1.0, 0.20, 0.05)
+        conf_threshold = st.slider("Confidence Threshold", 0.0, 1.0, 0.25, 0.05)
     with colT1:
         iou_threshold = st.slider("IOU Threshold", 0.0, 1.0, 0.50, 0.05)
 
@@ -331,23 +349,28 @@ def main():
         with c1:
             frame_skip = st.slider("Frame skip", 1, 8, 2, 1, help="큰 값일수록 덜 많은 프레임 추론 → 더 빠름")
         with c2:
-            resize_w = st.slider("Resize width", 320, 1280, 960, 40, help="가로 리사이즈(성능 향상)")
+            resize_w = st.slider("Resize width", 320, 1280, 800, 40, help="가로 리사이즈(표시 성능)")
         with c3:
-            max_frames = st.slider("Max frames", 100, 4000, 1200, 100, help="안전 종료 상한")
+            max_frames = st.slider("Max frames", 100, 6000, 3000, 100, help="안전 종료 상한")
 
+        # 라이브 최적값으로 실행
         if video_path:
-            if st.button("▶ Start video inference"):
+            if st.button("▶ Start video inference (Live)"):
+                # 혹시 이전 정지 플래그가 남아있다면 초기화
+                st.session_state["stop_video"] = False
                 with st.spinner("Running video inference…"):
                     predict_video(
                         model,
                         source=video_path,
                         conf_threshold=conf_threshold,
                         iou_threshold=iou_threshold,
-                        frame_skip=frame_skip,
-                        resize_w=resize_w,
+                        frame_skip=frame_skip,   # 2~4 권장
+                        resize_w=resize_w,       # 640~960 권장
                         max_frames=max_frames,
-                        hud=True,        # 영상 내부에 HUD(FPS/클래스 카운트) 오버레이
-                        preview=False     # 필요 시 True로 바꾸면 st.video 미리보기 추가
+                        hud=True,
+                        imgsz=480,               # 384~512 권장
+                        target_fps=12,           # 10~15 권장
+                        preview=False
                     )
 
 
